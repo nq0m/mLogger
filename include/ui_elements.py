@@ -24,3 +24,5 @@ class MLoggerLineEdit(QLineEdit):
         super().__init__(parent)
         self.setFont(QFont('Arial', 12))
         self.setStyleSheet(f'background: {GRAY}; color: {NAVY}; border: 1px solid {NAVY}; padding: 4px;')
+
+    # (Reverted) No keyPressEvent override; use default QLineEdit behavior
