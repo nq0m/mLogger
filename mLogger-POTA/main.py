@@ -119,6 +119,14 @@ class MainWindow(QWidget):
         layout.addWidget(table_group)
         self.setLayout(layout)
 
+        # FLRig polling timer
+        from PySide6.QtCore import QTimer
+        self.flrig_timer = QTimer(self)
+        self.flrig_timer.timeout.connect(self.poll_flrig_and_update_status)
+        self.flrig_enabled = False
+        self.flrig_host = '127.0.0.1'
+        self.flrig_port = 12345
+        self.flrig_poll = 30
         # Launch setup dialog immediately if not configured
         if not self.setup_complete:
             self.show_setup_dialog()
@@ -126,14 +134,31 @@ class MainWindow(QWidget):
     def update_config_bar(self):
         freq = self.setup_info['frequency'] if self.setup_info else '---'
         mode = self.setup_info['mode'] if self.setup_info else '---'
-        self.config_bar.setText(f'Frequency: {freq}    Mode: {mode}')
+        # If FLRig is enabled, use last polled values if available
+        if self.flrig_enabled:
+            freq = getattr(self, '_flrig_last_freq', freq)
+            mode = getattr(self, '_flrig_last_mode', mode)
+            flrig_status = '    FLRig: ON'
+        else:
+            flrig_status = ''
+        self.config_bar.setText(f'Frequency: {freq}    Mode: {mode}{flrig_status}')
 
         # Keyboard shortcuts (install event filter and set focus at the very end)
         for field in [self.sent_rst_field, self.recv_rst_field, self.park_field, self.comments_field]:
             field.installEventFilter(self)
-        # (Revert) Remove debug print
         self.call_field.returnPressed.connect(self.save_fields)
         self.call_field.setFocus()
+
+    def poll_flrig_and_update_status(self):
+        from include.flrig_utils import poll_flrig_frequency_mode
+        freq, mode = poll_flrig_frequency_mode(self.flrig_host, self.flrig_port)
+        if freq and mode:
+            self._flrig_last_freq = freq
+            self._flrig_last_mode = mode
+        else:
+            self._flrig_last_freq = '---'
+            self._flrig_last_mode = '---'
+        self.update_config_bar()
 
     def clear_fields(self):
         self.call_field.clear()
@@ -169,8 +194,12 @@ class MainWindow(QWidget):
         if not self.db:
             pass
         # Use frequency and mode from setup_info
-        freq = self.setup_info['frequency'] if self.setup_info else ''
-        mode = self.setup_info['mode'] if self.setup_info else ''
+        if self.flrig_enabled:
+            freq = getattr(self, '_flrig_last_freq', '')
+            mode = getattr(self, '_flrig_last_mode', '')
+        else:
+            freq = self.setup_info['frequency'] if self.setup_info else ''
+            mode = self.setup_info['mode'] if self.setup_info else ''
         from include.band_utils import get_band_from_frequency
         band = get_band_from_frequency(freq)
         contact = {
@@ -230,6 +259,22 @@ class MainWindow(QWidget):
         if dialog.exec() == QDialog.Accepted:
             setup_info = dialog.get_setup_info()
             self.setup_info = setup_info
+            # FLRig integration
+            self.flrig_enabled = setup_info.get('flrig_enabled', False)
+            self.flrig_host = setup_info.get('flrig_host', '127.0.0.1')
+            try:
+                self.flrig_port = int(setup_info.get('flrig_port', 12345))
+            except Exception:
+                self.flrig_port = 12345
+            try:
+                self.flrig_poll = int(setup_info.get('flrig_poll', 30))
+            except Exception:
+                self.flrig_poll = 30
+            if self.flrig_enabled:
+                self.flrig_timer.start(self.flrig_poll * 1000)
+                self.poll_flrig_and_update_status()
+            else:
+                self.flrig_timer.stop()
             self.update_config_bar()
             date_str = utc_ymd()
             config_dir = get_config_dir()
@@ -288,18 +333,51 @@ class SetupDialog(QDialog):
         self.setWindowTitle('Setup')
         self.setStyleSheet('background-color: #1c2d3c;')
         from PySide6.QtGui import QFont
+        from PySide6.QtWidgets import QCheckBox
         label_font = QFont('Arial', 9)
         # Entry fields
         self.callsign_field = MLoggerLineEdit()
         self.park_field = MLoggerLineEdit()
         self.freq_field = MLoggerLineEdit()
         self.mode_field = MLoggerLineEdit()
+        # FLRig integration fields
+        self.flrig_checkbox = QCheckBox('FLRig Integration')
+        self.flrig_checkbox.setFont(label_font)
+        # Toggle switch style
+        self.flrig_checkbox.setStyleSheet('''
+            QCheckBox {
+                color: #4b7d65; font-weight: bold;
+            }
+            QCheckBox::indicator {
+                width: 40px; height: 20px;
+                border-radius: 10px;
+            }
+            QCheckBox::indicator:unchecked {
+                background: #ccc;
+                border: 2px solid #4b7d65;
+            }
+            QCheckBox::indicator:checked {
+                background: #4b7d65;
+                border: 2px solid #4b7d65;
+            }
+        ''')
+        self.flrig_host_field = MLoggerLineEdit()
+        self.flrig_port_field = MLoggerLineEdit()
+        self.flrig_poll_field = MLoggerLineEdit()
+        self.flrig_host_field.setText('127.0.0.1')
+        self.flrig_port_field.setText('12345')
+        self.flrig_poll_field.setText('30')
         # Pre-fill fields if initial_data is provided
         if initial_data:
             self.callsign_field.setText(initial_data.get('callsign', ''))
             self.park_field.setText(initial_data.get('activation_park', ''))
             self.freq_field.setText(initial_data.get('frequency', ''))
             self.mode_field.setText(initial_data.get('mode', ''))
+            if initial_data.get('flrig_enabled'):
+                self.flrig_checkbox.setChecked(True)
+                self.flrig_host_field.setText(initial_data.get('flrig_host', '127.0.0.1'))
+                self.flrig_port_field.setText(str(initial_data.get('flrig_port', '12345')))
+                self.flrig_poll_field.setText(str(initial_data.get('flrig_poll', '30')))
         # Grid layout for labels above fields
         grid = QGridLayout()
         callsign_label = MLoggerLabel('Your Callsign')
@@ -318,6 +396,25 @@ class SetupDialog(QDialog):
         grid.addWidget(self.park_field, 1, 1)
         grid.addWidget(self.freq_field, 3, 0)
         grid.addWidget(self.mode_field, 3, 1)
+        # FLRig integration row
+        grid.addWidget(self.flrig_checkbox, 4, 0, 1, 2)
+        # FLRig fields (host/port/poll) - will be shown/hidden dynamically
+        self.flrig_host_label = MLoggerLabel('FLRig Host')
+        self.flrig_host_label.setFont(label_font)
+        self.flrig_port_label = MLoggerLabel('FLRig Port')
+        self.flrig_port_label.setFont(label_font)
+        self.flrig_poll_label = MLoggerLabel('Poll Interval (s)')
+        self.flrig_poll_label.setFont(label_font)
+        grid.addWidget(self.flrig_host_label, 5, 0)
+        grid.addWidget(self.flrig_port_label, 5, 1)
+        grid.addWidget(self.flrig_host_field, 6, 0)
+        grid.addWidget(self.flrig_port_field, 6, 1)
+        grid.addWidget(self.flrig_poll_label, 7, 0)
+        grid.addWidget(self.flrig_poll_field, 7, 1)
+        # Hide FLRig fields by default
+        self._set_flrig_fields_visible(self.flrig_checkbox.isChecked())
+        # Connect checkbox
+        self.flrig_checkbox.stateChanged.connect(self._on_flrig_checkbox_changed)
         # Buttons
         self.save_btn = MLoggerButton('Save')
         self.cancel_btn = MLoggerButton('Cancel')
@@ -334,7 +431,6 @@ class SetupDialog(QDialog):
         group_box.setLayout(group_box_layout)
         group_box.setStyleSheet('QGroupBox { border-radius: 8px; border: 2px solid #4b7d65; margin-top: 8px; color: #4b7d65; font-weight: bold; } QGroupBox:title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }')
         group_box.setSizePolicy(group_box.sizePolicy().horizontalPolicy(), QSizePolicy.Fixed)
-        group_box.setMinimumHeight(group_box.sizeHint().height())
         # Main layout
         layout = QVBoxLayout()
         layout.addWidget(group_box)
@@ -342,13 +438,37 @@ class SetupDialog(QDialog):
         self.setLayout(layout)
         self.callsign_field.setFocus()
 
+    def _on_flrig_checkbox_changed(self, state):
+        checked = self.flrig_checkbox.isChecked()
+        self.freq_field.setDisabled(checked)
+        self.mode_field.setDisabled(checked)
+        self._set_flrig_fields_visible(checked)
+        self.adjustSize()
+
+    def _set_flrig_fields_visible(self, visible):
+        self.flrig_host_label.setVisible(visible)
+        self.flrig_port_label.setVisible(visible)
+        self.flrig_poll_label.setVisible(visible)
+        self.flrig_host_field.setVisible(visible)
+        self.flrig_port_field.setVisible(visible)
+        self.flrig_poll_field.setVisible(visible)
+
     def get_setup_info(self):
-        return {
+        info = {
             'callsign': self.callsign_field.text(),
             'activation_park': self.park_field.text(),
             'frequency': self.freq_field.text(),
-            'mode': self.mode_field.text()
+            'mode': self.mode_field.text(),
+            'flrig_enabled': self.flrig_checkbox.isChecked(),
+            'flrig_host': self.flrig_host_field.text(),
+            'flrig_port': self.flrig_port_field.text(),
+            'flrig_poll': self.flrig_poll_field.text()
         }
+        if info['flrig_enabled']:
+            # Ignore frequency/mode if FLRig is enabled
+            info['frequency'] = ''
+            info['mode'] = ''
+        return info
 
 def main():
     app = QApplication(sys.argv)
